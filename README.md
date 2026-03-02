@@ -1,20 +1,52 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# ZapMulti - WhatsApp Multi-Agent Platform
 
-# Run and deploy your AI Studio app
+Este projeto é uma plataforma multi-agente para gerenciar conversas do WhatsApp Business com atualizações em tempo real e recursos de atribuição.
 
-This contains everything you need to run your app locally.
+## Requisitos
 
-View your app in AI Studio: https://ai.studio/apps/fba576b5-d53e-4e7d-901a-62f7225b78f9
+- Node.js >= 20.0.0
+- npm
 
-## Run Locally
+## Instalação
 
-**Prerequisites:**  Node.js
+1. Clone o repositório.
+2. Instale as dependências:
+   ```bash
+   npm install
+   ```
+3. Crie um arquivo `.env` na raiz do projeto com base no `.env.example`:
+   ```env
+   PORT=3000
+   GEMINI_API_KEY="AIzaSyAx6u_3pD1ZjVBBbePD0lvtFDdeF4XmW_M"
+   ```
 
+## Desenvolvimento
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+Para iniciar o servidor de desenvolvimento:
+```bash
+npm run dev
+```
+
+## Produção
+
+Para preparar e iniciar em produção:
+```bash
+npm run build
+npm start
+```
+
+## Estrutura de Dados
+
+- O banco de dados SQLite é salvo como `whatsapp_v2.db`.
+- As sessões do WhatsApp são salvas em pastas `auth_info_{sessionId}`.
+
+## Deploy no Hostinger / VPS
+
+1. Certifique-se de que o Node.js 20+ está instalado.
+2. Faça o upload dos arquivos.
+3. Execute `npm install`.
+4. O script `postinstall` criará a pasta `dist` automaticamente.
+5. Use um gerenciador de processos como o `pm2` para manter o app rodando:
+   ```bash
+   pm2 start npm --name "zapmulti" -- start
+   ```

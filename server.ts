@@ -227,8 +227,27 @@ async function startServer() {
   const sessionStatus = new Map<string, string>();
   const sessionQR = new Map<string, string | null>();
   const sessionRetries = new Map<string, number>();
+  const sessionConnecting = new Map<string, boolean>();
 
   async function connectToWhatsApp(sessionId: string = 'default') {
+    if (sessionConnecting.get(sessionId)) {
+      console.log(`Session ${sessionId} is already connecting. Skipping...`);
+      return;
+    }
+
+    const existingSock = sessions.get(sessionId);
+    if (existingSock) {
+      if (existingSock.ws?.readyState === WebSocket.OPEN) {
+        console.log(`Session ${sessionId} is already connected. Skipping...`);
+        return;
+      }
+      // If there's an existing socket that's not open, try to end it before starting a new one
+      try {
+        existingSock.end(new Error('New connection starting'));
+      } catch (e) {}
+    }
+
+    sessionConnecting.set(sessionId, true);
     try {
       console.log(`Initializing WhatsApp connection for session: ${sessionId}...`);
       const authPath = path.join(__dirname, `auth_info_${sessionId}`);
@@ -265,6 +284,9 @@ async function startServer() {
         sock.ev.removeAllListeners('connection.update');
         sock.ev.removeAllListeners('creds.update');
         sock.ev.removeAllListeners('messages.upsert');
+        try {
+          sock.end(undefined);
+        } catch (e) {}
         if (sessions.get(sessionId) === sock) {
           sessions.delete(sessionId);
         }
@@ -273,8 +295,23 @@ async function startServer() {
       sock.ev.on('connection.update', async (update: any) => {
         const { connection, lastDisconnect, qr } = update;
         
-        if (connection) console.log(`Session ${sessionId} connection update: ${connection}`);
-        if (lastDisconnect?.error) console.log(`Session ${sessionId} disconnect error:`, lastDisconnect.error);
+        if (connection) {
+          console.log(`Session ${sessionId} connection update: ${connection}`);
+          if (connection === 'open') {
+            sessionConnecting.set(sessionId, false);
+          }
+        }
+        
+        if (lastDisconnect?.error) {
+          console.log(`Session ${sessionId} disconnect error:`, lastDisconnect.error);
+          const errorMsg = lastDisconnect.error.message || "";
+          if (errorMsg.includes('conflict')) {
+            console.log(`Session ${sessionId} conflict detected (another instance is connected). Waiting 30s before retry...`);
+            sessionConnecting.set(sessionId, false);
+            sessionStatus.set(sessionId, "conflict");
+            broadcast({ type: "AUTH_STATE", sessionId, payload: { status: "conflict", error: "Conexão em conflito (aberta em outro lugar)" } });
+          }
+        }
 
         if (qr) {
           const qrData = await QRCode.toDataURL(qr);
@@ -299,6 +336,7 @@ async function startServer() {
           const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
           if (statusCode === DisconnectReason.loggedOut) {
+            sessionConnecting.set(sessionId, false);
             cleanup();
             console.log(`Session ${sessionId} logged out. Clearing...`);
             if (fs.existsSync(authPath)) {
@@ -307,15 +345,18 @@ async function startServer() {
             await db.run("UPDATE connections SET status = 'disconnected' WHERE id = ?", sessionId);
             broadcast({ type: "AUTH_STATE", sessionId, payload: { status: "logged_out" } });
           } else if (shouldReconnect) {
+            sessionConnecting.set(sessionId, false);
             cleanup();
             const isTimeout = statusCode === DisconnectReason.timedOut || statusCode === 408 || isRestartRequired;
+            const isConflict = errorMsg.toLowerCase().includes('conflict');
             const retries = sessionRetries.get(sessionId) || 0;
-            // If it's a timeout or restart required, retry faster
-            const delay = isTimeout ? 1000 : Math.min(Math.pow(2, retries) * 1000, 30000);
             
-            console.log(`Reconnecting session ${sessionId} in ${delay}ms... (Reason: ${isTimeout ? 'Timeout/Restart' : statusCode})`);
+            // If it's a conflict, wait much longer (e.g., 30s)
+            const delay = isConflict ? 30000 : (isTimeout ? 1000 : Math.min(Math.pow(2, retries) * 1000, 30000));
             
-            sessionRetries.set(sessionId, isTimeout ? 0 : retries + 1);
+            console.log(`Reconnecting session ${sessionId} in ${delay}ms... (Reason: ${isConflict ? 'Conflict' : (isTimeout ? 'Timeout/Restart' : statusCode)})`);
+            
+            sessionRetries.set(sessionId, isConflict ? 0 : (isTimeout ? 0 : retries + 1));
             setTimeout(() => connectToWhatsApp(sessionId), delay);
           }
 

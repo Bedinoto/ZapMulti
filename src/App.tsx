@@ -16,7 +16,8 @@ import {
   Users,
   Filter,
   Paperclip,
-  Image as ImageIcon
+  Image as ImageIcon,
+  AlertCircle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -786,12 +787,14 @@ export default function App() {
                           <div className="flex items-center mt-1">
                             <div className={`w-2 h-2 rounded-full mr-2 ${
                               conn.status === 'connected' ? 'bg-[#25D366]' : 
-                              conn.status === 'qr_ready' ? 'bg-yellow-400' : 'bg-red-400'
+                              conn.status === 'qr_ready' ? 'bg-yellow-400' : 
+                              conn.status === 'conflict' ? 'bg-orange-500' : 'bg-red-400'
                             }`} />
                             <span className="text-xs text-[#667781] uppercase font-bold tracking-wider">
                               {conn.status === 'connected' ? 'Conectado' : 
                                conn.status === 'qr_ready' ? 'Aguardando QR' : 
-                               conn.status === 'initializing' ? 'Iniciando' : 'Desconectado'}
+                               conn.status === 'initializing' ? 'Iniciando' : 
+                               conn.status === 'conflict' ? 'Conflito' : 'Desconectado'}
                             </span>
                           </div>
                         </div>
@@ -824,6 +827,12 @@ export default function App() {
                         <div className="flex flex-col items-center justify-center h-44 bg-green-50 rounded-xl mb-4 text-green-600">
                           <CheckCheck size={48} className="mb-2" />
                           <p className="text-sm font-bold">Pronto para uso</p>
+                        </div>
+                      ) : conn.status === 'conflict' ? (
+                        <div className="flex flex-col items-center justify-center h-44 bg-orange-50 rounded-xl mb-4 text-orange-600 p-4 text-center">
+                          <AlertCircle size={48} className="mb-2" />
+                          <p className="text-sm font-bold">Conflito de Sessão</p>
+                          <p className="text-[10px] mt-1 opacity-80">Esta conta está aberta em outro lugar. Aguardando liberação...</p>
                         </div>
                       ) : (
                         <div className="flex flex-col items-center justify-center h-44 bg-gray-50 rounded-xl mb-4 text-gray-400">
