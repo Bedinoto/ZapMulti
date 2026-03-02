@@ -69,6 +69,7 @@ export default function App() {
   const [showAgentsManager, setShowAgentsManager] = useState(false);
   const [showConnectionsManager, setShowConnectionsManager] = useState(false);
   const [selectedSessionId, setSelectedSessionId] = useState<string>('default');
+  const [filterSessionId, setFilterSessionId] = useState<string | 'all'>('all');
   const [currentUser] = useState({ id: 'agent_1', name: 'Admin Agent', role: 'admin' });
   
   const [newAgentName, setNewAgentName] = useState('');
@@ -104,7 +105,7 @@ export default function App() {
   // Fetch messages when contact changes
   useEffect(() => {
     if (selectedContact) {
-      fetch(`/api/messages/${selectedContact.id}`)
+      fetch(`/api/messages/${selectedContact.id}?sessionId=${selectedContact.session_id}`)
         .then(res => res.json())
         .then(data => setMessages(data));
     }
@@ -137,27 +138,26 @@ export default function App() {
 
       if (data.type === 'NEW_MESSAGE') {
         const newMsg = data.payload;
-        // const sessionId = data.sessionId; // Could be used to filter or tag messages
+        const sessionId = data.sessionId;
         
         // Update messages if it's the current conversation
-        if (selectedContact && newMsg.contact_id === selectedContact.id) {
+        if (selectedContact && newMsg.contact_id === selectedContact.id && sessionId === selectedContact.session_id) {
           setMessages(prev => [...prev, newMsg]);
         }
 
         // Update contacts list
         setContacts(prev => {
-          const existing = prev.find(c => c.id === newMsg.contact_id);
-          const isCurrentContact = selectedContact && newMsg.contact_id === selectedContact.id;
+          const existing = prev.find(c => c.id === newMsg.contact_id && c.session_id === sessionId);
+          const isCurrentContact = selectedContact && newMsg.contact_id === selectedContact.id && sessionId === selectedContact.session_id;
           
           if (existing) {
             return [
               { 
                 ...existing, 
                 last_message_at: newMsg.timestamp, 
-                session_id: data.sessionId,
                 unread_count: isCurrentContact ? 0 : (existing.unread_count || 0) + (newMsg.type === 'incoming' ? 1 : 0)
               },
-              ...prev.filter(c => c.id !== newMsg.contact_id)
+              ...prev.filter(c => !(c.id === newMsg.contact_id && c.session_id === sessionId))
             ];
           } else {
             return [
@@ -165,7 +165,7 @@ export default function App() {
                 id: newMsg.contact_id, 
                 name: newMsg.contact_name || newMsg.contact_id, 
                 last_message_at: newMsg.timestamp,
-                session_id: data.sessionId,
+                session_id: sessionId,
                 unread_count: isCurrentContact ? 0 : (newMsg.type === 'incoming' ? 1 : 0)
               },
               ...prev
@@ -175,17 +175,17 @@ export default function App() {
       }
 
       if (data.type === 'CONTACT_ASSIGNED') {
-        const { contactId, agentId } = data.payload;
-        setContacts(prev => prev.map(c => c.id === contactId ? { ...c, assigned_to: agentId } : c));
-        if (selectedContact?.id === contactId) {
+        const { contactId, agentId, sessionId } = data.payload;
+        setContacts(prev => prev.map(c => (c.id === contactId && c.session_id === sessionId) ? { ...c, assigned_to: agentId } : c));
+        if (selectedContact?.id === contactId && selectedContact?.session_id === sessionId) {
           setSelectedContact(prev => prev ? { ...prev, assigned_to: agentId } : null);
         }
       }
 
       if (data.type === 'CONTACT_DELETED') {
-        const { contactId } = data.payload;
-        setContacts(prev => prev.filter(c => c.id !== contactId));
-        if (selectedContact?.id === contactId) {
+        const { contactId, sessionId } = data.payload;
+        setContacts(prev => prev.filter(c => !(c.id === contactId && c.session_id === sessionId)));
+        if (selectedContact?.id === contactId && selectedContact?.session_id === sessionId) {
           setSelectedContact(null);
           setMessages([]);
         }
@@ -280,28 +280,47 @@ export default function App() {
   };
 
   const filteredContacts = useMemo(() => {
-    const filtered = contacts.filter(c => 
+    let filtered = contacts.filter(c => 
       c.name.toLowerCase().includes(searchTerm.toLowerCase()) || 
       c.id.includes(searchTerm)
     );
+
+    if (filterSessionId !== 'all') {
+      filtered = filtered.filter(c => c.session_id === filterSessionId);
+    }
 
     if (activeTab === 'waiting') {
       return filtered.filter(c => !c.assigned_to);
     } else {
       return filtered.filter(c => !!c.assigned_to);
     }
-  }, [contacts, searchTerm, activeTab]);
+  }, [contacts, searchTerm, activeTab, filterSessionId]);
+
+  const getConnectionColor = (id: string) => {
+    const colors = [
+      'bg-blue-100 text-blue-700 border-blue-200',
+      'bg-purple-100 text-purple-700 border-purple-200',
+      'bg-orange-100 text-orange-700 border-orange-200',
+      'bg-pink-100 text-pink-700 border-pink-200',
+      'bg-indigo-100 text-indigo-700 border-indigo-200',
+      'bg-cyan-100 text-cyan-700 border-cyan-200',
+    ];
+    if (id === 'default') return 'bg-emerald-100 text-emerald-700 border-emerald-200';
+    // Simple hash for stable color
+    const index = id.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0) % colors.length;
+    return colors[index];
+  };
 
   const formatTime = (timestamp: string) => {
     return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
-  const handleAccept = async (contactId: string) => {
+  const handleAccept = async (contactId: string, sessionId: string) => {
     try {
       await fetch('/api/assign', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contactId, agentId: currentUser.id })
+        body: JSON.stringify({ contactId, agentId: currentUser.id, sessionId })
       });
       setActiveTab('active');
     } catch (err) {
@@ -309,13 +328,11 @@ export default function App() {
     }
   };
 
-  const handleFinish = async (contactId: string) => {
+  const handleFinish = async (contactId: string, sessionId: string) => {
     if (!confirm('Deseja realmente finalizar este atendimento?')) return;
     try {
-      await fetch('/api/assign', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contactId, agentId: null })
+      await fetch(`/api/contacts/${contactId}?sessionId=${sessionId}`, {
+        method: 'DELETE'
       });
       setSelectedContact(null);
     } catch (err) {
@@ -323,10 +340,10 @@ export default function App() {
     }
   };
 
-  const handleReject = async (contactId: string) => {
+  const handleReject = async (contactId: string, sessionId: string) => {
     if (!confirm('Tem certeza que deseja recusar e excluir este atendimento?')) return;
     try {
-      await fetch(`/api/contacts/${contactId}`, {
+      await fetch(`/api/contacts/${contactId}?sessionId=${sessionId}`, {
         method: 'DELETE'
       });
     } catch (err) {
@@ -498,29 +515,58 @@ export default function App() {
           </button>
         </div>
 
-        <div className="p-2">
+        <div className="p-2 space-y-2">
           <div className="relative">
             <Search className="absolute left-3 top-2.5 text-[#54656F]" size={18} />
             <input
               type="text"
-              placeholder="Pesquisar ou começar uma nova conversa"
+              placeholder="Pesquisar conversas..."
               className="w-full bg-[#F0F2F5] rounded-lg py-2 pl-10 pr-4 text-sm focus:outline-none"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
             />
           </div>
+
+          {/* Connection Filter Chips */}
+          {connections.length > 1 && (
+            <div className="flex overflow-x-auto pb-1 space-x-2 no-scrollbar">
+              <button
+                onClick={() => setFilterSessionId('all')}
+                className={`flex-shrink-0 px-3 py-1 rounded-full text-[10px] font-bold border transition-all ${
+                  filterSessionId === 'all' 
+                    ? 'bg-[#00A884] text-white border-[#00A884]' 
+                    : 'bg-white text-[#667781] border-[#D1D7DB] hover:bg-[#F5F6F6]'
+                }`}
+              >
+                TODAS
+              </button>
+              {connections.map(conn => (
+                <button
+                  key={conn.id}
+                  onClick={() => setFilterSessionId(conn.id)}
+                  className={`flex-shrink-0 px-3 py-1 rounded-full text-[10px] font-bold border transition-all truncate max-w-[120px] ${
+                    filterSessionId === conn.id 
+                      ? 'bg-[#00A884] text-white border-[#00A884]' 
+                      : 'bg-white text-[#667781] border-[#D1D7DB] hover:bg-[#F5F6F6]'
+                  }`}
+                >
+                  {conn.name.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="flex-1 overflow-y-auto">
           {filteredContacts.map(contact => (
             <div
-              key={contact.id}
-              className={`w-full flex flex-col border-b border-[#F0F2F5] transition-colors ${selectedContact?.id === contact.id ? 'bg-[#F0F2F5]' : 'hover:bg-[#F5F6F6]'}`}
+              key={`${contact.id}-${contact.session_id}`}
+              className={`w-full flex flex-col border-b border-[#F0F2F5] transition-colors ${selectedContact?.id === contact.id && selectedContact?.session_id === contact.session_id ? 'bg-[#F0F2F5]' : 'hover:bg-[#F5F6F6]'}`}
             >
               <button
                 onClick={() => {
                   setSelectedContact(contact);
-                  setContacts(prev => prev.map(c => c.id === contact.id ? { ...c, unread_count: 0 } : c));
+                  setContacts(prev => prev.map(c => (c.id === contact.id && c.session_id === contact.session_id) ? { ...c, unread_count: 0 } : c));
                 }}
                 className="w-full flex items-center p-3 text-left"
               >
@@ -541,9 +587,9 @@ export default function App() {
                         )}
                       </span>
                       {contact.session_id && (
-                        <span className="text-[9px] text-[#00A884] font-bold uppercase tracking-tighter">
+                        <div className={`mt-0.5 px-1.5 py-0.5 rounded border text-[8px] font-bold uppercase w-fit leading-none ${getConnectionColor(contact.session_id)}`}>
                           {connections.find(conn => conn.id === contact.session_id)?.name || 'Conexão'}
-                        </span>
+                        </div>
                       )}
                     </div>
                     <span className="text-xs text-[#667781]">{formatTime(contact.last_message_at)}</span>
@@ -566,7 +612,7 @@ export default function App() {
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      handleAccept(contact.id);
+                      handleAccept(contact.id, contact.session_id!);
                     }}
                     className="flex-1 bg-[#00A884] text-white text-xs font-bold py-1.5 rounded hover:bg-[#008F70] transition-colors flex items-center justify-center"
                   >
@@ -575,7 +621,7 @@ export default function App() {
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      handleReject(contact.id);
+                      handleReject(contact.id, contact.session_id!);
                     }}
                     className="flex-1 bg-white text-red-500 border border-red-500 text-xs font-bold py-1.5 rounded hover:bg-red-50 transition-colors flex items-center justify-center"
                   >
@@ -589,7 +635,7 @@ export default function App() {
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      handleFinish(contact.id);
+                      handleFinish(contact.id, contact.session_id!);
                     }}
                     className="flex-1 bg-[#00A884] text-white text-xs font-bold py-1.5 rounded hover:bg-[#008F70] transition-colors flex items-center justify-center"
                   >
@@ -892,7 +938,14 @@ export default function App() {
                   {selectedContact.is_group ? <Users size={20} /> : <User size={20} />}
                 </div>
                 <div>
-                  <h2 className="font-medium">{selectedContact.name}</h2>
+                  <div className="flex items-center">
+                    <h2 className="font-medium">{selectedContact.name}</h2>
+                    {selectedContact.session_id && (
+                      <span className={`ml-2 px-1.5 py-0.5 rounded border text-[8px] font-bold uppercase leading-none ${getConnectionColor(selectedContact.session_id)}`}>
+                        {connections.find(conn => conn.id === selectedContact.session_id)?.name || 'Conexão'}
+                      </span>
+                    )}
+                  </div>
                   <p className="text-xs text-[#667781]">
                     {selectedContact.is_group ? 'Grupo' : (selectedContact.assigned_to ? `Atribuído a ${selectedContact.assigned_to}` : 'Clique para informações')}
                   </p>

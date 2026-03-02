@@ -14,7 +14,8 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   WAMessageKey,
   WAMessageContent,
-  proto
+  proto,
+  jidNormalizedUser
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import QRCode from "qrcode";
@@ -27,10 +28,7 @@ const __dirname = path.dirname(__filename);
 
 function normalizeJid(jid: string): string {
   if (!jid) return jid;
-  if (jid.includes('@g.us')) return jid;
-  const [user] = jid.split('@');
-  const [userId] = user.split(':');
-  return `${userId}@s.whatsapp.net`;
+  return jidNormalizedUser(jid);
 }
 
 async function startServer() {
@@ -44,16 +42,19 @@ async function startServer() {
   // Initialize Database
   await db.exec(`
     CREATE TABLE IF NOT EXISTS contacts (
-      id TEXT PRIMARY KEY,
+      id TEXT,
+      session_id TEXT,
       name TEXT,
       last_message_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       assigned_to TEXT,
       is_group INTEGER DEFAULT 0,
-      session_id TEXT
+      unread_count INTEGER DEFAULT 0,
+      PRIMARY KEY (id, session_id)
     );
 
     CREATE TABLE IF NOT EXISTS messages (
-      id TEXT PRIMARY KEY,
+      id TEXT,
+      session_id TEXT,
       contact_id TEXT,
       sender_id TEXT,
       sender_name TEXT,
@@ -61,8 +62,8 @@ async function startServer() {
       type TEXT, -- 'incoming' or 'outgoing'
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
       status TEXT, -- 'sent', 'delivered', 'read'
-      session_id TEXT,
-      FOREIGN KEY(contact_id) REFERENCES contacts(id)
+      PRIMARY KEY (id, session_id),
+      FOREIGN KEY(contact_id, session_id) REFERENCES contacts(id, session_id)
     );
 
     CREATE TABLE IF NOT EXISTS agents (
@@ -83,34 +84,75 @@ async function startServer() {
     INSERT OR IGNORE INTO agents (id, name, role, status) VALUES ('agent_1', 'Admin Agent', 'admin', 'online');
   `);
 
-  // Migration: Add session_id if missing from existing tables
-  try { await db.run("ALTER TABLE contacts ADD COLUMN session_id TEXT"); } catch (e) {}
-  try { await db.run("ALTER TABLE messages ADD COLUMN session_id TEXT"); } catch (e) {}
-  try { await db.run("ALTER TABLE contacts ADD COLUMN unread_count INTEGER DEFAULT 0"); } catch (e) {}
+  // Migration: Normalize existing JIDs and handle schema changes
+  try {
+    // Check if contacts has a composite PK
+    const tableInfo = await db.all("PRAGMA table_info(contacts)");
+    const pkCount = tableInfo.filter((c: any) => c.pk > 0).length;
+    
+    if (pkCount < 2) {
+      console.log("Migrating database to composite primary keys...");
+      
+      // 1. Migrate contacts
+      await db.exec("ALTER TABLE contacts RENAME TO contacts_old");
+      await db.exec(`
+        CREATE TABLE contacts (
+          id TEXT,
+          session_id TEXT,
+          name TEXT,
+          last_message_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          assigned_to TEXT,
+          is_group INTEGER DEFAULT 0,
+          unread_count INTEGER DEFAULT 0,
+          PRIMARY KEY (id, session_id)
+        )
+      `);
+      await db.exec(`
+        INSERT OR IGNORE INTO contacts (id, session_id, name, last_message_at, assigned_to, is_group, unread_count)
+        SELECT id, COALESCE(session_id, 'default'), name, last_message_at, assigned_to, is_group, COALESCE(unread_count, 0)
+        FROM contacts_old
+      `);
+      await db.exec("DROP TABLE contacts_old");
 
-  // Migration: Normalize existing JIDs
-  const contactsToMerge = await db.all("SELECT id, unread_count FROM contacts WHERE id LIKE '%:%@s.whatsapp.net'");
-  for (const contact of contactsToMerge as any[]) {
+      // 2. Migrate messages
+      await db.exec("ALTER TABLE messages RENAME TO messages_old");
+      await db.exec(`
+        CREATE TABLE messages (
+          id TEXT,
+          session_id TEXT,
+          contact_id TEXT,
+          sender_id TEXT,
+          sender_name TEXT,
+          text TEXT,
+          type TEXT,
+          timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+          status TEXT,
+          PRIMARY KEY (id, session_id),
+          FOREIGN KEY(contact_id, session_id) REFERENCES contacts(id, session_id)
+        )
+      `);
+      await db.exec(`
+        INSERT OR IGNORE INTO messages (id, session_id, contact_id, sender_id, sender_name, text, type, timestamp, status)
+        SELECT id, COALESCE(session_id, 'default'), contact_id, sender_id, sender_name, text, type, timestamp, status
+        FROM messages_old
+      `);
+      await db.exec("DROP TABLE messages_old");
+    }
+  } catch (e) {
+    console.error("Migration error:", e);
+  }
+
+  // Normalize all existing JIDs in the new schema
+  const allContacts = await db.all("SELECT id, session_id FROM contacts");
+  for (const contact of allContacts as any[]) {
     const normalized = normalizeJid(contact.id);
     if (normalized !== contact.id) {
       try {
-        // Update messages to point to the normalized JID
-        await db.run("UPDATE messages SET contact_id = ? WHERE contact_id = ?", normalized, contact.id);
-        await db.run("UPDATE messages SET sender_id = ? WHERE sender_id = ?", normalized, contact.id);
-        
-        // Check if normalized contact exists
-        const exists = await db.get("SELECT id FROM contacts WHERE id = ?", normalized);
-        if (exists) {
-          // Merge unread_count
-          await db.run("UPDATE contacts SET unread_count = unread_count + ? WHERE id = ?", contact.unread_count || 0, normalized);
-          // Delete the old one
-          await db.run("DELETE FROM contacts WHERE id = ?", contact.id);
-        } else {
-          // Rename the old one
-          await db.run("UPDATE contacts SET id = ? WHERE id = ?", normalized, contact.id);
-        }
+        await db.run("UPDATE OR IGNORE contacts SET id = ? WHERE id = ? AND session_id = ?", normalized, contact.id, contact.session_id);
+        await db.run("UPDATE messages SET contact_id = ? WHERE contact_id = ? AND session_id = ?", normalized, contact.id, contact.session_id);
+        await db.run("DELETE FROM contacts WHERE id = ? AND session_id = ?", contact.id, contact.session_id);
       } catch (e) {
-        console.error("Error merging contact:", contact.id, e);
+        console.error("Error normalizing contact during startup:", contact.id, e);
       }
     }
   }
@@ -291,20 +333,19 @@ async function startServer() {
               const unreadIncrement = type === 'incoming' ? 1 : 0;
 
               await db.run(`
-                INSERT INTO contacts (id, name, last_message_at, is_group, session_id, unread_count)
-                VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET 
+                INSERT INTO contacts (id, session_id, name, last_message_at, is_group, unread_count)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+                ON CONFLICT(id, session_id) DO UPDATE SET 
                   name = CASE WHEN contacts.name = contacts.id THEN excluded.name ELSE contacts.name END,
                   last_message_at = CURRENT_TIMESTAMP,
-                  session_id = excluded.session_id,
                   unread_count = unread_count + excluded.unread_count
-              `, sender, name, isGroup ? 1 : 0, sessionId, unreadIncrement);
+              `, sender, sessionId, name, isGroup ? 1 : 0, unreadIncrement);
 
               const msgId = msg.key.id;
               await db.run(`
-                INSERT OR IGNORE INTO messages (id, contact_id, sender_id, sender_name, text, type, status, session_id)
-                VALUES (?, ?, ?, ?, ?, ?, 'received', ?)
-              `, msgId, sender, sender, name, text, type, sessionId);
+                INSERT OR IGNORE INTO messages (id, session_id, contact_id, sender_id, sender_name, text, type, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'received')
+              `, msgId, sessionId, sender, sender, name, text, type);
 
               broadcast({
                 type: "NEW_MESSAGE",
@@ -379,8 +420,12 @@ async function startServer() {
 
   app.get("/api/messages/:contactId", async (req, res) => {
     const { contactId } = req.params;
-    await db.run("UPDATE contacts SET unread_count = 0 WHERE id = ?", contactId);
-    const messages = await db.all("SELECT * FROM messages WHERE contact_id = ? ORDER BY timestamp ASC", contactId);
+    const { sessionId } = req.query;
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId is required" });
+    }
+    await db.run("UPDATE contacts SET unread_count = 0 WHERE id = ? AND session_id = ?", contactId, sessionId);
+    const messages = await db.all("SELECT * FROM messages WHERE contact_id = ? AND session_id = ? ORDER BY timestamp ASC", contactId, sessionId);
     res.json(messages);
   });
 
@@ -427,7 +472,8 @@ async function startServer() {
   });
 
   app.post("/api/send", async (req, res) => {
-    const { contactId, text, media, sessionId = 'default' } = req.body;
+    const { contactId: rawContactId, text, media, sessionId = 'default' } = req.body;
+    const contactId = normalizeJid(rawContactId);
     
     const sock = sessions.get(sessionId);
     if (!sock || sessionStatus.get(sessionId) !== "connected") {
@@ -462,9 +508,9 @@ async function startServer() {
       const messageId = sentMsg.key.id;
 
       await db.run(`
-        INSERT INTO messages (id, contact_id, text, type, status, session_id)
-        VALUES (?, ?, ?, 'outgoing', 'sent', ?)
-      `, messageId, contactId, messageText, sessionId);
+        INSERT INTO messages (id, session_id, contact_id, sender_id, sender_name, text, type, status)
+        VALUES (?, ?, ?, 'me', 'Me', ?, 'outgoing', 'sent')
+      `, messageId, sessionId, contactId, messageText);
 
       broadcast({
         type: "NEW_MESSAGE",
@@ -480,18 +526,19 @@ async function startServer() {
   });
 
   app.post("/api/assign", async (req, res) => {
-    const { contactId, agentId } = req.body;
-    await db.run("UPDATE contacts SET assigned_to = ? WHERE id = ?", agentId, contactId);
-    broadcast({ type: "CONTACT_ASSIGNED", payload: { contactId, agentId } });
+    const { contactId, agentId, sessionId } = req.body;
+    await db.run("UPDATE contacts SET assigned_to = ? WHERE id = ? AND session_id = ?", agentId, contactId, sessionId);
+    broadcast({ type: "CONTACT_ASSIGNED", payload: { contactId, agentId, sessionId } });
     res.json({ success: true });
   });
 
   app.delete("/api/contacts/:contactId", async (req, res) => {
     const { contactId } = req.params;
+    const { sessionId } = req.query;
     try {
-      await db.run("DELETE FROM messages WHERE contact_id = ?", contactId);
-      await db.run("DELETE FROM contacts WHERE id = ?", contactId);
-      broadcast({ type: "CONTACT_DELETED", payload: { contactId } });
+      await db.run("DELETE FROM messages WHERE contact_id = ? AND session_id = ?", contactId, sessionId);
+      await db.run("DELETE FROM contacts WHERE id = ? AND session_id = ?", contactId, sessionId);
+      broadcast({ type: "CONTACT_DELETED", payload: { contactId, sessionId } });
       res.json({ success: true });
     } catch (error) {
       console.error("Delete contact error:", error);
