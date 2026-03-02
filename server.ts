@@ -86,60 +86,91 @@ async function startServer() {
 
   // Migration: Normalize existing JIDs and handle schema changes
   try {
+    console.log("Checking database schema...");
     // Check if contacts has a composite PK
     const tableInfo = await db.all("PRAGMA table_info(contacts)");
-    const pkCount = tableInfo.filter((c: any) => c.pk > 0).length;
-    
-    if (pkCount < 2) {
-      console.log("Migrating database to composite primary keys...");
-      
-      // 1. Migrate contacts
-      await db.exec("ALTER TABLE contacts RENAME TO contacts_old");
-      await db.exec(`
-        CREATE TABLE contacts (
-          id TEXT,
-          session_id TEXT,
-          name TEXT,
-          last_message_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          assigned_to TEXT,
-          is_group INTEGER DEFAULT 0,
-          unread_count INTEGER DEFAULT 0,
-          PRIMARY KEY (id, session_id)
-        )
-      `);
-      await db.exec(`
-        INSERT OR IGNORE INTO contacts (id, session_id, name, last_message_at, assigned_to, is_group, unread_count)
-        SELECT id, COALESCE(session_id, 'default'), name, last_message_at, assigned_to, is_group, COALESCE(unread_count, 0)
-        FROM contacts_old
-      `);
-      await db.exec("DROP TABLE contacts_old");
+    if (tableInfo.length > 0) {
+      const pkCount = tableInfo.filter((c: any) => c.pk > 0).length;
+      const hasUnreadCount = tableInfo.some((c: any) => c.name === 'unread_count');
+      const hasSessionId = tableInfo.some((c: any) => c.name === 'session_id');
 
-      // 2. Migrate messages
-      await db.exec("ALTER TABLE messages RENAME TO messages_old");
-      await db.exec(`
-        CREATE TABLE messages (
-          id TEXT,
-          session_id TEXT,
-          contact_id TEXT,
-          sender_id TEXT,
-          sender_name TEXT,
-          text TEXT,
-          type TEXT,
-          timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-          status TEXT,
-          PRIMARY KEY (id, session_id),
-          FOREIGN KEY(contact_id, session_id) REFERENCES contacts(id, session_id)
-        )
-      `);
-      await db.exec(`
-        INSERT OR IGNORE INTO messages (id, session_id, contact_id, sender_id, sender_name, text, type, timestamp, status)
-        SELECT id, COALESCE(session_id, 'default'), contact_id, sender_id, sender_name, text, type, timestamp, status
-        FROM messages_old
-      `);
-      await db.exec("DROP TABLE messages_old");
+      if (pkCount < 2 || !hasUnreadCount || !hasSessionId) {
+        console.log("Migrating database to composite primary keys and new columns...");
+        
+        // 1. Migrate contacts
+        await db.exec("DROP TABLE IF EXISTS contacts_old");
+        await db.exec("ALTER TABLE contacts RENAME TO contacts_old");
+        await db.exec(`
+          CREATE TABLE contacts (
+            id TEXT,
+            session_id TEXT,
+            name TEXT,
+            last_message_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            assigned_to TEXT,
+            is_group INTEGER DEFAULT 0,
+            unread_count INTEGER DEFAULT 0,
+            PRIMARY KEY (id, session_id)
+          )
+        `);
+        
+        // Build dynamic insert to handle missing columns in old table
+        const oldCols = (await db.all("PRAGMA table_info(contacts_old)")).map((c: any) => c.name);
+        const selectId = oldCols.includes('id') ? 'id' : 'NULL';
+        const selectSessionId = oldCols.includes('session_id') ? 'session_id' : "'default'";
+        const selectName = oldCols.includes('name') ? 'name' : 'id';
+        const selectLastMsg = oldCols.includes('last_message_at') ? 'last_message_at' : 'CURRENT_TIMESTAMP';
+        const selectAssigned = oldCols.includes('assigned_to') ? 'assigned_to' : 'NULL';
+        const selectIsGroup = oldCols.includes('is_group') ? 'is_group' : '0';
+        const selectUnread = oldCols.includes('unread_count') ? 'unread_count' : '0';
+
+        await db.exec(`
+          INSERT OR IGNORE INTO contacts (id, session_id, name, last_message_at, assigned_to, is_group, unread_count)
+          SELECT ${selectId}, ${selectSessionId}, ${selectName}, ${selectLastMsg}, ${selectAssigned}, ${selectIsGroup}, ${selectUnread}
+          FROM contacts_old
+        `);
+        await db.exec("DROP TABLE IF EXISTS contacts_old");
+
+        // 2. Migrate messages
+        await db.exec("DROP TABLE IF EXISTS messages_old");
+        await db.exec("ALTER TABLE messages RENAME TO messages_old");
+        await db.exec(`
+          CREATE TABLE messages (
+            id TEXT,
+            session_id TEXT,
+            contact_id TEXT,
+            sender_id TEXT,
+            sender_name TEXT,
+            text TEXT,
+            type TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT,
+            PRIMARY KEY (id, session_id),
+            FOREIGN KEY(contact_id, session_id) REFERENCES contacts(id, session_id)
+          )
+        `);
+        
+        const oldMsgCols = (await db.all("PRAGMA table_info(messages_old)")).map((c: any) => c.name);
+        const mId = oldMsgCols.includes('id') ? 'id' : 'NULL';
+        const mSession = oldMsgCols.includes('session_id') ? 'session_id' : "'default'";
+        const mContact = oldMsgCols.includes('contact_id') ? 'contact_id' : 'NULL';
+        const mSender = oldMsgCols.includes('sender_id') ? 'sender_id' : 'contact_id';
+        const mSenderName = oldMsgCols.includes('sender_name') ? 'sender_name' : 'sender_id';
+        const mText = oldMsgCols.includes('text') ? 'text' : "''";
+        const mType = oldMsgCols.includes('type') ? 'type' : "'incoming'";
+        const mTime = oldMsgCols.includes('timestamp') ? 'timestamp' : 'CURRENT_TIMESTAMP';
+        const mStatus = oldMsgCols.includes('status') ? 'status' : "'received'";
+
+        await db.exec(`
+          INSERT OR IGNORE INTO messages (id, session_id, contact_id, sender_id, sender_name, text, type, timestamp, status)
+          SELECT ${mId}, ${mSession}, ${mContact}, ${mSender}, ${mSenderName}, ${mText}, ${mType}, ${mTime}, ${mStatus}
+          FROM messages_old
+        `);
+        await db.exec("DROP TABLE IF EXISTS messages_old");
+        console.log("Database migration completed successfully.");
+      }
     }
   } catch (e) {
-    console.error("Migration error:", e);
+    console.error("Migration error (continuing anyway):", e);
   }
 
   // Normalize all existing JIDs in the new schema
