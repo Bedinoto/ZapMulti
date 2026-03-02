@@ -2,7 +2,8 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
-import Database from "better-sqlite3";
+import { open } from "sqlite";
+import sqlite3 from "sqlite3";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
@@ -34,11 +35,14 @@ function normalizeJid(jid: string): string {
 
 async function startServer() {
   console.log("Starting server script...");
-  const db = new Database("whatsapp_v2.db");
+  const db = await open({
+    filename: "whatsapp_v2.db",
+    driver: sqlite3.Database
+  });
   console.log("Database connected.");
 
   // Initialize Database
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS contacts (
       id TEXT PRIMARY KEY,
       name TEXT,
@@ -80,30 +84,30 @@ async function startServer() {
   `);
 
   // Migration: Add session_id if missing from existing tables
-  try { db.prepare("ALTER TABLE contacts ADD COLUMN session_id TEXT").run(); } catch (e) {}
-  try { db.prepare("ALTER TABLE messages ADD COLUMN session_id TEXT").run(); } catch (e) {}
-  try { db.prepare("ALTER TABLE contacts ADD COLUMN unread_count INTEGER DEFAULT 0").run(); } catch (e) {}
+  try { await db.run("ALTER TABLE contacts ADD COLUMN session_id TEXT"); } catch (e) {}
+  try { await db.run("ALTER TABLE messages ADD COLUMN session_id TEXT"); } catch (e) {}
+  try { await db.run("ALTER TABLE contacts ADD COLUMN unread_count INTEGER DEFAULT 0"); } catch (e) {}
 
   // Migration: Normalize existing JIDs
-  const contactsToMerge = db.prepare("SELECT id, unread_count FROM contacts WHERE id LIKE '%:%@s.whatsapp.net'").all();
+  const contactsToMerge = await db.all("SELECT id, unread_count FROM contacts WHERE id LIKE '%:%@s.whatsapp.net'");
   for (const contact of contactsToMerge as any[]) {
     const normalized = normalizeJid(contact.id);
     if (normalized !== contact.id) {
       try {
         // Update messages to point to the normalized JID
-        db.prepare("UPDATE messages SET contact_id = ? WHERE contact_id = ?").run(normalized, contact.id);
-        db.prepare("UPDATE messages SET sender_id = ? WHERE sender_id = ?").run(normalized, contact.id);
+        await db.run("UPDATE messages SET contact_id = ? WHERE contact_id = ?", normalized, contact.id);
+        await db.run("UPDATE messages SET sender_id = ? WHERE sender_id = ?", normalized, contact.id);
         
         // Check if normalized contact exists
-        const exists = db.prepare("SELECT id FROM contacts WHERE id = ?").get(normalized);
+        const exists = await db.get("SELECT id FROM contacts WHERE id = ?", normalized);
         if (exists) {
           // Merge unread_count
-          db.prepare("UPDATE contacts SET unread_count = unread_count + ? WHERE id = ?").run(contact.unread_count || 0, normalized);
+          await db.run("UPDATE contacts SET unread_count = unread_count + ? WHERE id = ?", contact.unread_count || 0, normalized);
           // Delete the old one
-          db.prepare("DELETE FROM contacts WHERE id = ?").run(contact.id);
+          await db.run("DELETE FROM contacts WHERE id = ?", contact.id);
         } else {
           // Rename the old one
-          db.prepare("UPDATE contacts SET id = ? WHERE id = ?").run(normalized, contact.id);
+          await db.run("UPDATE contacts SET id = ? WHERE id = ?", normalized, contact.id);
         }
       } catch (e) {
         console.error("Error merging contact:", contact.id, e);
@@ -227,7 +231,7 @@ async function startServer() {
             if (fs.existsSync(authPath)) {
               fs.rmSync(authPath, { recursive: true, force: true });
             }
-            db.prepare("UPDATE connections SET status = 'disconnected' WHERE id = ?").run(sessionId);
+            await db.run("UPDATE connections SET status = 'disconnected' WHERE id = ?", sessionId);
             broadcast({ type: "AUTH_STATE", sessionId, payload: { status: "logged_out" } });
           } else if (shouldReconnect) {
             cleanup();
@@ -248,7 +252,7 @@ async function startServer() {
           sessionStatus.set(sessionId, "connected");
           sessionQR.set(sessionId, null);
           sessionRetries.set(sessionId, 0);
-          db.prepare("UPDATE connections SET status = 'connected' WHERE id = ?").run(sessionId);
+          await db.run("UPDATE connections SET status = 'connected' WHERE id = ?", sessionId);
           broadcast({ type: "AUTH_STATE", sessionId, payload: { status: "connected" } });
         }
       });
@@ -286,7 +290,7 @@ async function startServer() {
               const type = msg.key.fromMe ? 'outgoing' : 'incoming';
               const unreadIncrement = type === 'incoming' ? 1 : 0;
 
-              db.prepare(`
+              await db.run(`
                 INSERT INTO contacts (id, name, last_message_at, is_group, session_id, unread_count)
                 VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET 
@@ -294,13 +298,13 @@ async function startServer() {
                   last_message_at = CURRENT_TIMESTAMP,
                   session_id = excluded.session_id,
                   unread_count = unread_count + excluded.unread_count
-              `).run(sender, name, isGroup ? 1 : 0, sessionId, unreadIncrement);
+              `, sender, name, isGroup ? 1 : 0, sessionId, unreadIncrement);
 
               const msgId = msg.key.id;
-              db.prepare(`
+              await db.run(`
                 INSERT OR IGNORE INTO messages (id, contact_id, sender_id, sender_name, text, type, status, session_id)
                 VALUES (?, ?, ?, ?, ?, ?, 'received', ?)
-              `).run(msgId, sender, sender, name, text, type, sessionId);
+              `, msgId, sender, sender, name, text, type, sessionId);
 
               broadcast({
                 type: "NEW_MESSAGE",
@@ -325,9 +329,9 @@ async function startServer() {
   }
 
   // Initialize existing connections
-  const existingConnections = db.prepare("SELECT id FROM connections").all();
+  const existingConnections = await db.all("SELECT id FROM connections");
   if (existingConnections.length === 0) {
-    db.prepare("INSERT INTO connections (id, name, status) VALUES ('default', 'Conexão Principal', 'disconnected')").run();
+    await db.run("INSERT INTO connections (id, name, status) VALUES ('default', 'Conexão Principal', 'disconnected')");
     connectToWhatsApp('default');
   } else {
     existingConnections.forEach((conn: any) => {
@@ -336,21 +340,21 @@ async function startServer() {
   }
 
   // API Endpoints
-  app.get("/api/contacts", (req, res) => {
-    const contacts = db.prepare("SELECT * FROM contacts ORDER BY last_message_at DESC").all();
+  app.get("/api/contacts", async (req, res) => {
+    const contacts = await db.all("SELECT * FROM contacts ORDER BY last_message_at DESC");
     res.json(contacts);
   });
 
-  app.get("/api/agents", (req, res) => {
-    const agents = db.prepare("SELECT * FROM agents").all();
+  app.get("/api/agents", async (req, res) => {
+    const agents = await db.all("SELECT * FROM agents");
     res.json(agents);
   });
 
-  app.post("/api/agents", (req, res) => {
+  app.post("/api/agents", async (req, res) => {
     const { name, role } = req.body;
     const id = "agent_" + Date.now();
     try {
-      db.prepare("INSERT INTO agents (id, name, role, status) VALUES (?, ?, ?, 'offline')").run(id, name, role);
+      await db.run("INSERT INTO agents (id, name, role, status) VALUES (?, ?, ?, 'offline')", id, name, role);
       const newAgent = { id, name, role, status: 'offline' };
       broadcast({ type: "AGENT_CREATED", payload: newAgent });
       res.json(newAgent);
@@ -359,13 +363,13 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/agents/:id", (req, res) => {
+  app.delete("/api/agents/:id", async (req, res) => {
     const { id } = req.params;
     if (id === 'agent_1') return res.status(400).json({ error: "Cannot delete default admin" });
     try {
-      db.prepare("DELETE FROM agents WHERE id = ?").run(id);
+      await db.run("DELETE FROM agents WHERE id = ?", id);
       // Unassign contacts
-      db.prepare("UPDATE contacts SET assigned_to = NULL WHERE assigned_to = ?").run(id);
+      await db.run("UPDATE contacts SET assigned_to = NULL WHERE assigned_to = ?", id);
       broadcast({ type: "AGENT_DELETED", payload: { id } });
       res.json({ success: true });
     } catch (error) {
@@ -373,15 +377,15 @@ async function startServer() {
     }
   });
 
-  app.get("/api/messages/:contactId", (req, res) => {
+  app.get("/api/messages/:contactId", async (req, res) => {
     const { contactId } = req.params;
-    db.prepare("UPDATE contacts SET unread_count = 0 WHERE id = ?").run(contactId);
-    const messages = db.prepare("SELECT * FROM messages WHERE contact_id = ? ORDER BY timestamp ASC").all(contactId);
+    await db.run("UPDATE contacts SET unread_count = 0 WHERE id = ?", contactId);
+    const messages = await db.all("SELECT * FROM messages WHERE contact_id = ? ORDER BY timestamp ASC", contactId);
     res.json(messages);
   });
 
-  app.get("/api/connections", (req, res) => {
-    const connections = db.prepare("SELECT * FROM connections").all();
+  app.get("/api/connections", async (req, res) => {
+    const connections = await db.all("SELECT * FROM connections");
     const enriched = connections.map((conn: any) => ({
       ...conn,
       status: sessionStatus.get(conn.id) || conn.status,
@@ -390,10 +394,10 @@ async function startServer() {
     res.json(enriched);
   });
 
-  app.post("/api/connections", (req, res) => {
+  app.post("/api/connections", async (req, res) => {
     const { name } = req.body;
     const id = `conn_${Date.now()}`;
-    db.prepare("INSERT INTO connections (id, name, status) VALUES (?, ?, 'disconnected')").run(id, name);
+    await db.run("INSERT INTO connections (id, name, status) VALUES (?, ?, 'disconnected')", id, name);
     connectToWhatsApp(id);
     res.json({ success: true, id });
   });
@@ -412,7 +416,7 @@ async function startServer() {
         fs.rmSync(authPath, { recursive: true, force: true });
       }
       
-      db.prepare("DELETE FROM connections WHERE id = ?").run(id);
+      await db.run("DELETE FROM connections WHERE id = ?", id);
       sessionStatus.delete(id);
       sessionQR.delete(id);
       
@@ -457,11 +461,10 @@ async function startServer() {
 
       const messageId = sentMsg.key.id;
 
-      const insertMsg = db.prepare(`
+      await db.run(`
         INSERT INTO messages (id, contact_id, text, type, status, session_id)
         VALUES (?, ?, ?, 'outgoing', 'sent', ?)
-      `);
-      insertMsg.run(messageId, contactId, messageText, sessionId);
+      `, messageId, contactId, messageText, sessionId);
 
       broadcast({
         type: "NEW_MESSAGE",
@@ -476,18 +479,18 @@ async function startServer() {
     }
   });
 
-  app.post("/api/assign", (req, res) => {
+  app.post("/api/assign", async (req, res) => {
     const { contactId, agentId } = req.body;
-    db.prepare("UPDATE contacts SET assigned_to = ? WHERE id = ?").run(agentId, contactId);
+    await db.run("UPDATE contacts SET assigned_to = ? WHERE id = ?", agentId, contactId);
     broadcast({ type: "CONTACT_ASSIGNED", payload: { contactId, agentId } });
     res.json({ success: true });
   });
 
-  app.delete("/api/contacts/:contactId", (req, res) => {
+  app.delete("/api/contacts/:contactId", async (req, res) => {
     const { contactId } = req.params;
     try {
-      db.prepare("DELETE FROM messages WHERE contact_id = ?").run(contactId);
-      db.prepare("DELETE FROM contacts WHERE id = ?").run(contactId);
+      await db.run("DELETE FROM messages WHERE contact_id = ?", contactId);
+      await db.run("DELETE FROM contacts WHERE id = ?", contactId);
       broadcast({ type: "CONTACT_DELETED", payload: { contactId } });
       res.json({ success: true });
     } catch (error) {
@@ -520,7 +523,7 @@ async function startServer() {
       // Reset auth state in memory and notify clients
       sessionQR.set(sessionId, null);
       sessionStatus.set(sessionId, "logged_out");
-      db.prepare("UPDATE connections SET status = 'disconnected' WHERE id = ?").run(sessionId);
+      await db.run("UPDATE connections SET status = 'disconnected' WHERE id = ?", sessionId);
       
       broadcast({ 
         type: "AUTH_STATE", 
